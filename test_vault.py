@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Archive Keeper 自动化测试
+Vault 自动化测试
 ========================
 构造测试数据，覆盖所有关键场景。
 """
 
 import os
 import sys
+import json
+import hashlib
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-SCRIPT = str(Path(__file__).parent / "archive_keeper.py")
+SCRIPT = str(Path(__file__).parent / "vault.py")
 PYTHON = sys.executable
 
 # 测试根目录
@@ -24,7 +26,7 @@ test_num = 0
 
 
 def run_cmd(command, archive_root=None, dry_run=False, expect_fail=False):
-    """运行 archive_keeper 命令"""
+    """运行 vault 命令"""
     if archive_root is None:
         archive_root = TEST_ROOT
     env = os.environ.copy()
@@ -82,6 +84,7 @@ def main():
     test("init 命令成功", ok, out)
     test("master 目录存在", (TEST_ROOT / "master").is_dir())
     test("mirrors/mirror_1 目录存在", (TEST_ROOT / "mirrors" / "mirror_1").is_dir())
+    test("mirrors/mirror_2 目录存在", (TEST_ROOT / "mirrors" / "mirror_2").is_dir())
     test("config.json 存在", (TEST_ROOT / ".archive" / "config.json").is_file())
     test("baseline.json 存在", (TEST_ROOT / ".archive" / "baseline.json").is_file())
 
@@ -101,6 +104,8 @@ def main():
          (TEST_ROOT / "mirrors" / "mirror_1" / "图片" / "photo.dat").is_file())
     test("镜像内容一致 notes.txt",
          read_file(TEST_ROOT / "mirrors" / "mirror_1" / "notes.txt") == "笔记内容ABC")
+    test("第二份镜像内容一致 notes.txt",
+         read_file(TEST_ROOT / "mirrors" / "mirror_2" / "notes.txt") == "笔记内容ABC")
 
     # 校验
     ok, out = run_cmd("verify")
@@ -128,6 +133,20 @@ def main():
     # 删除保护下，镜像中文件应仍然存在
     test("镜像中被删文件仍保留（删除保护）",
          (TEST_ROOT / "mirrors" / "mirror_1" / "图片" / "photo.dat").is_file())
+    test("第二份镜像中被删文件仍保留（删除保护）",
+         (TEST_ROOT / "mirrors" / "mirror_2" / "图片" / "photo.dat").is_file())
+    ok, out = run_cmd("repair", dry_run=True)
+    test("repair --dry-run 可预演清理镜像遗留文件", ok, out)
+    test("预演不会删除镜像遗留文件",
+         (TEST_ROOT / "mirrors" / "mirror_1" / "图片" / "photo.dat").is_file())
+    ok, out = run_cmd("repair")
+    test("repair 会清理镜像遗留文件", ok, out)
+    test("镜像遗留文件已删除",
+         not (TEST_ROOT / "mirrors" / "mirror_1" / "图片" / "photo.dat").exists())
+    test("第二份镜像遗留文件已删除",
+         not (TEST_ROOT / "mirrors" / "mirror_2" / "图片" / "photo.dat").exists())
+    ok, out = run_cmd("verify")
+    test("清理遗留文件后校验通过", ok, out)
 
     # ==========================================
     # 测试 5: 创建快照
@@ -217,21 +236,39 @@ def main():
     # 再次快照
     run_cmd("snapshot")
 
-    # 现在破坏主副本和镜像 → 快照作为第三个可信源
+    # 现在破坏主副本和一个镜像，保留另一份镜像正确
     write_file(TEST_ROOT / "master" / "notes.txt", "错误内容Z")
     write_file(TEST_ROOT / "mirrors" / "mirror_1" / "notes.txt", "错误内容Z")
 
     ok, out = run_cmd("repair")
-    # 主副本和镜像一致但与基准不同 → 快照能提供历史参考
-    # 这里 2 vs 1（快照+基准 vs 主+镜像），可能判定为人工介入
-    # 或者如果主副本和镜像一致（2票），基准+快照也是2票 → 冲突
-    test("快照参与判定（不会静默忽略）",
-         "快照" in out or "基准" in out or "人工" in out or "不一致" in out, out[:500])
+    test("历史证据支持时 repair 成功", ok, out)
+    test("主副本已恢复到历史支持版本",
+         read_file(TEST_ROOT / "master" / "notes.txt") == "笔记内容ABC — 已修改版本2")
+    test("损坏镜像已恢复到历史支持版本",
+         read_file(TEST_ROOT / "mirrors" / "mirror_1" / "notes.txt") == "笔记内容ABC — 已修改版本2")
+    test("未损坏镜像保持正确版本",
+         read_file(TEST_ROOT / "mirrors" / "mirror_2" / "notes.txt") == "笔记内容ABC — 已修改版本2")
 
     # ==========================================
-    # 测试 10: 统一维护流程
+    # 测试 10: 当前链整体一致但与历史冲突 → 必须人工确认
     # ==========================================
-    print("\n--- 测试组 10: 统一维护 maintain ---")
+    print("\n--- 测试组 10: 当前链冲突需人工确认 ---")
+    write_file(TEST_ROOT / "master" / "notes.txt", "整体错误版本Q")
+    write_file(TEST_ROOT / "mirrors" / "mirror_1" / "notes.txt", "整体错误版本Q")
+    write_file(TEST_ROOT / "mirrors" / "mirror_2" / "notes.txt", "整体错误版本Q")
+
+    ok, out = run_cmd("repair")
+    has_manual_hint = ("人工" in out or "无法自动" in out or "警告" in out)
+    test("当前链整体冲突时提示人工介入", has_manual_hint, out[:500])
+    test("人工介入场景不会自动改写当前链",
+         read_file(TEST_ROOT / "master" / "notes.txt") == "整体错误版本Q")
+    test("人工介入场景不会自动改写镜像",
+         read_file(TEST_ROOT / "mirrors" / "mirror_1" / "notes.txt") == "整体错误版本Q")
+
+    # ==========================================
+    # 测试 11: 统一维护流程
+    # ==========================================
+    print("\n--- 测试组 11: 统一维护 maintain ---")
     # 先恢复干净
     write_file(TEST_ROOT / "master" / "notes.txt", "维护测试最终版本")
     ok, out = run_cmd("maintain")
@@ -239,9 +276,9 @@ def main():
     test("maintain 输出包含汇总", "汇总" in out or "总体状态" in out, out[:500])
 
     # ==========================================
-    # 测试 11: 幂等性 — 重复运行稳定
+    # 测试 12: 幂等性 — 重复运行稳定
     # ==========================================
-    print("\n--- 测试组 11: 幂等性 ---")
+    print("\n--- 测试组 12: 幂等性 ---")
     # 先清理：删除镜像中多余的 photo.dat（删除保护遗留）
     leftover = TEST_ROOT / "mirrors" / "mirror_1" / "图片" / "photo.dat"
     if leftover.exists():
@@ -259,20 +296,47 @@ def main():
          read_file(TEST_ROOT / "master" / "notes.txt") == "维护测试最终版本")
 
     # ==========================================
-    # 测试 12: 预演模式
+    # 测试 13: 预演模式
     # ==========================================
-    print("\n--- 测试组 12: 预演模式 ---")
+    print("\n--- 测试组 13: 预演模式 ---")
     ok, out = run_cmd("maintain", dry_run=True)
     test("maintain --dry-run 成功", ok, out)
     test("预演输出包含标识", "预演" in out, out[:300])
 
     # ==========================================
-    # 测试 13: status
+    # 测试 14: status
     # ==========================================
-    print("\n--- 测试组 13: status ---")
+    print("\n--- 测试组 14: status ---")
     ok, out = run_cmd("status")
     test("status 命令成功", ok, out)
     test("status 显示文件数", "个文件" in out, out[:300])
+
+    # ==========================================
+    # 测试 15: hash_algorithm 配置生效
+    # ==========================================
+    print("\n--- 测试组 15: hash_algorithm 配置 ---")
+    algo_root = TEST_ROOT / "_algo_case"
+    ok, out = run_cmd("init", archive_root=algo_root)
+    test("独立归档根初始化成功", ok, out)
+
+    config_path = algo_root / ".archive" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["hash_algorithm"] = "blake2b"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    algo_text = "hash algorithm test"
+    write_file(algo_root / "master" / "algo.txt", algo_text)
+    ok, out = run_cmd("sync", archive_root=algo_root)
+    test("切换到 blake2b 后 sync 成功", ok, out)
+
+    baseline = json.loads((algo_root / ".archive" / "baseline.json").read_text(encoding="utf-8"))
+    expected_hash = hashlib.new("blake2b", algo_text.encode("utf-8")).hexdigest()
+    test("baseline 记录的算法是 blake2b", baseline.get("algorithm") == "blake2b")
+    test("baseline 中的哈希值按 blake2b 生成",
+         baseline["files"]["algo.txt"]["hash"] == expected_hash)
+
+    ok, out = run_cmd("verify", archive_root=algo_root)
+    test("blake2b 配置下 verify 通过", ok, out)
 
     # ==========================================
     # 汇总

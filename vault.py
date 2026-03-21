@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Archive Keeper — 单盘多副本归档维护工具
+Vault — 单盘多副本归档维护工具
 ========================================
 纯 Python stdlib 实现，零外部依赖。
 单文件即完整工具，拷贝即可使用。
 
 用法:
-    python archive_keeper.py init <归档根目录>
-    python archive_keeper.py sync <归档根目录> [--dry-run]
-    python archive_keeper.py verify <归档根目录>
-    python archive_keeper.py snapshot <归档根目录> [--dry-run]
-    python archive_keeper.py repair <归档根目录> [--dry-run]
-    python archive_keeper.py maintain <归档根目录> [--dry-run]
-    python archive_keeper.py status <归档根目录>
+    python vault.py init <归档根目录>
+    python vault.py sync <归档根目录> [--dry-run]
+    python vault.py verify <归档根目录>
+    python vault.py snapshot <归档根目录> [--dry-run]
+    python vault.py repair <归档根目录> [--dry-run]
+    python vault.py maintain <归档根目录> [--dry-run]
+    python vault.py status <归档根目录>
 """
 
 import argparse
@@ -32,7 +32,7 @@ from typing import Optional
 # 版本与常量
 # ============================================================
 VERSION = "1.0.0"
-PROGRAM_NAME = "Archive Keeper"
+PROGRAM_NAME = "Vault"
 SYSTEM_DIR = ".archive"
 CONFIG_FILE = "config.json"
 BASELINE_FILE = "baseline.json"
@@ -41,6 +41,7 @@ MIRRORS_DIR = "mirrors"
 SNAPSHOTS_DIR = "snapshots"
 LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
+FIXED_MIRROR_COUNT = 2
 
 # 状态码
 STATUS_OK = "通过"
@@ -54,10 +55,24 @@ HASH_ALGORITHM = "sha256"
 HASH_BLOCK_SIZE = 1024 * 1024  # 1MB
 
 
-def compute_file_hash(filepath: Path) -> Optional[str]:
+def validate_hash_algorithm(algorithm: str) -> str:
+    """验证哈希算法是否受 hashlib 支持。"""
+    try:
+        hashlib.new(algorithm)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"不支持的 hash_algorithm: {algorithm}") from e
+    return algorithm
+
+
+def get_config_hash_algorithm(config: dict) -> str:
+    """从配置中读取并验证当前使用的哈希算法。"""
+    return validate_hash_algorithm(config.get("hash_algorithm", HASH_ALGORITHM))
+
+
+def compute_file_hash(filepath: Path, algorithm: str = HASH_ALGORITHM) -> Optional[str]:
     """计算文件哈希。返回十六进制摘要，失败返回 None。"""
     try:
-        h = hashlib.new(HASH_ALGORITHM)
+        h = hashlib.new(algorithm)
         with open(filepath, "rb") as f:
             while True:
                 block = f.read(HASH_BLOCK_SIZE)
@@ -75,7 +90,6 @@ def compute_file_hash(filepath: Path) -> Optional[str]:
 DEFAULT_CONFIG = {
     "version": VERSION,
     "hash_algorithm": HASH_ALGORITHM,
-    "mirror_count": 1,
     "max_snapshots": 10,
     "ignore_patterns": [
         ".archive",
@@ -222,7 +236,7 @@ def should_ignore(rel_path: str, ignore_patterns: list) -> bool:
     return False
 
 
-def scan_directory(base_dir: Path, ignore_patterns: list) -> dict:
+def scan_directory(base_dir: Path, ignore_patterns: list, algorithm: str = HASH_ALGORITHM) -> dict:
     """
     扫描目录，返回 {相对路径: {"size": int, "mtime": float, "hash": str}}
     """
@@ -242,7 +256,7 @@ def scan_directory(base_dir: Path, ignore_patterns: list) -> dict:
                 continue
             try:
                 st = fpath.stat()
-                file_hash = compute_file_hash(fpath)
+                file_hash = compute_file_hash(fpath, algorithm)
                 result[rel] = {
                     "size": st.st_size,
                     "mtime": st.st_mtime,
@@ -276,6 +290,30 @@ def scan_directory_fast(base_dir: Path, ignore_patterns: list) -> set:
     return result
 
 
+def get_mirror_names() -> list[str]:
+    """返回固定的镜像目录名列表。"""
+    return [f"mirror_{i}" for i in range(1, FIXED_MIRROR_COUNT + 1)]
+
+
+def get_current_copy_path(archive_root: Path, master_dir: Path, source_name: str, rel: str) -> Path:
+    """返回主副本或镜像副本的实际路径。"""
+    if source_name == "主副本":
+        return master_dir / rel
+    return archive_root / MIRRORS_DIR / source_name / rel
+
+
+def choose_current_source_name(source_names: list[str]) -> Optional[str]:
+    """在当前链中选择优先使用的恢复源。"""
+    if "主副本" in source_names:
+        return "主副本"
+    for name in get_mirror_names():
+        if name in source_names:
+            return name
+    if source_names:
+        return source_names[0]
+    return None
+
+
 # ============================================================
 # 基准管理
 # ============================================================
@@ -305,6 +343,7 @@ def save_baseline(archive_root: Path, baseline: dict):
 def cmd_init(archive_root: Path, log: ArchiveLogger):
     """初始化归档目录结构"""
     log.info(f"初始化归档目录: {archive_root}")
+    algorithm = get_config_hash_algorithm(DEFAULT_CONFIG)
 
     # 检查是否已初始化
     if (archive_root / SYSTEM_DIR / CONFIG_FILE).exists():
@@ -314,11 +353,11 @@ def cmd_init(archive_root: Path, log: ArchiveLogger):
     # 创建目录结构
     dirs_to_create = [
         archive_root / MASTER_DIR,
-        archive_root / MIRRORS_DIR / "mirror_1",
         archive_root / SNAPSHOTS_DIR,
         archive_root / SYSTEM_DIR / LOGS_DIR,
         archive_root / SYSTEM_DIR / REPORTS_DIR,
     ]
+    dirs_to_create.extend(archive_root / MIRRORS_DIR / name for name in get_mirror_names())
     for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
         log.debug(f"创建目录: {d}")
@@ -330,7 +369,7 @@ def cmd_init(archive_root: Path, log: ArchiveLogger):
     # 初始化空基准
     save_baseline(archive_root, {
         "created": datetime.datetime.now().isoformat(),
-        "algorithm": HASH_ALGORITHM,
+        "algorithm": algorithm,
         "files": {},
     })
     log.info("校验基准已初始化。")
@@ -358,6 +397,7 @@ def cmd_init(archive_root: Path, log: ArchiveLogger):
 def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     """将主副本同步到镜像"""
     config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
     master_dir = archive_root / MASTER_DIR
     ignore = config["ignore_patterns"]
 
@@ -370,19 +410,16 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
 
     # 扫描主副本
     log.info("扫描主副本...")
-    master_files = scan_directory(master_dir, ignore)
+    master_files = scan_directory(master_dir, ignore, algorithm)
     log.stats["主副本文件数"] = len(master_files)
 
     overall = STATUS_OK
-    mirror_count = config.get("mirror_count", 1)
-
-    for i in range(1, mirror_count + 1):
-        mirror_name = f"mirror_{i}"
+    for mirror_name in get_mirror_names():
         mirror_dir = archive_root / MIRRORS_DIR / mirror_name
         mirror_dir.mkdir(parents=True, exist_ok=True)
 
         log.info(f"同步到 {mirror_name}...")
-        mirror_files = scan_directory(mirror_dir, ignore)
+        mirror_files = scan_directory(mirror_dir, ignore, algorithm)
 
         added = 0
         updated = 0
@@ -402,7 +439,7 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
                     try:
                         shutil.copy2(str(src), str(dst))
                         # 验证拷贝
-                        dst_hash = compute_file_hash(dst)
+                        dst_hash = compute_file_hash(dst, algorithm)
                         if dst_hash != info["hash"]:
                             log.error(f"  拷贝验证失败: {rel}")
                             errors += 1
@@ -420,7 +457,7 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         shutil.copy2(str(src), str(dst))
-                        dst_hash = compute_file_hash(dst)
+                        dst_hash = compute_file_hash(dst, algorithm)
                         if dst_hash != info["hash"]:
                             log.error(f"  更新验证失败: {rel}")
                             errors += 1
@@ -469,7 +506,7 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         log.info("更新校验基准...")
         baseline = load_baseline(archive_root)
         baseline["updated"] = datetime.datetime.now().isoformat()
-        baseline["algorithm"] = HASH_ALGORITHM
+        baseline["algorithm"] = algorithm
         baseline["files"] = {}
         for rel, info in master_files.items():
             baseline["files"][rel] = {
@@ -485,19 +522,28 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
 def cmd_verify(archive_root: Path, log: ArchiveLogger):
     """完整性校验"""
     config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
     baseline = load_baseline(archive_root)
     baseline_files = baseline.get("files", {})
+    baseline_algorithm = baseline.get("algorithm", HASH_ALGORITHM)
 
     log.info("开始完整性校验...")
+
+    if baseline_files and baseline_algorithm != algorithm:
+        log.error(
+            f"当前配置使用 {algorithm}，但校验基准使用 {baseline_algorithm}。"
+            "请先运行 sync 重新生成基准。"
+        )
+        return STATUS_ERROR
 
     overall = STATUS_OK
     issues = []
 
     # 1. 主副本 vs 基准
     log.info("校验主副本 vs 基准...")
-    master_files = scan_directory(master_dir, ignore)
+    master_files = scan_directory(master_dir, ignore, algorithm)
 
     ok_count = 0
     for rel, binfo in baseline_files.items():
@@ -525,9 +571,7 @@ def cmd_verify(archive_root: Path, log: ArchiveLogger):
     log.stats["主副本_文件总数"] = len(master_files)
 
     # 2. 各镜像 vs 基准 & vs 主副本
-    mirror_count = config.get("mirror_count", 1)
-    for i in range(1, mirror_count + 1):
-        mirror_name = f"mirror_{i}"
+    for mirror_name in get_mirror_names():
         mirror_dir = archive_root / MIRRORS_DIR / mirror_name
         if not mirror_dir.exists():
             log.warn(f"  镜像目录不存在: {mirror_name}")
@@ -535,7 +579,7 @@ def cmd_verify(archive_root: Path, log: ArchiveLogger):
             continue
 
         log.info(f"校验 {mirror_name}...")
-        mirror_files = scan_directory(mirror_dir, ignore)
+        mirror_files = scan_directory(mirror_dir, ignore, algorithm)
         m_ok = 0
 
         for rel, binfo in baseline_files.items():
@@ -593,6 +637,7 @@ def cmd_verify(archive_root: Path, log: ArchiveLogger):
 def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     """创建主副本的冻结快照"""
     config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
     max_snapshots = config.get("max_snapshots", 10)
@@ -612,7 +657,7 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         return STATUS_WARN
 
     # 扫描主副本
-    master_files = scan_directory(master_dir, ignore)
+    master_files = scan_directory(master_dir, ignore, algorithm)
     log.stats["快照文件数"] = len(master_files)
 
     if dry_run:
@@ -636,7 +681,7 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     # 保存快照自己的校验基准
     snap_baseline = {
         "created": datetime.datetime.now().isoformat(),
-        "algorithm": HASH_ALGORITHM,
+        "algorithm": algorithm,
         "source": "snapshot",
         "snapshot_id": ts,
         "files": {},
@@ -689,24 +734,31 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
 def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     """修复异常：基于主副本、镜像、快照、基准进行判定和修复"""
     config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
     baseline = load_baseline(archive_root)
     baseline_files = baseline.get("files", {})
+    baseline_algorithm = baseline.get("algorithm", HASH_ALGORITHM)
 
     mode_label = "【预演模式】" if dry_run else ""
     log.info(f"{mode_label}开始修复检查...")
 
-    # 收集所有副本的状态
-    master_files = scan_directory(master_dir, ignore)
+    if baseline_files and baseline_algorithm != algorithm:
+        log.error(
+            f"当前配置使用 {algorithm}，但校验基准使用 {baseline_algorithm}。"
+            "请先运行 sync 重新生成基准。"
+        )
+        return STATUS_ERROR
 
-    mirror_count = config.get("mirror_count", 1)
+    # 收集所有副本的状态
+    master_files = scan_directory(master_dir, ignore, algorithm)
+
     mirrors = {}
-    for i in range(1, mirror_count + 1):
-        name = f"mirror_{i}"
+    for name in get_mirror_names():
         mdir = archive_root / MIRRORS_DIR / name
         if mdir.exists():
-            mirrors[name] = scan_directory(mdir, ignore)
+            mirrors[name] = scan_directory(mdir, ignore, algorithm)
         else:
             mirrors[name] = {}
 
@@ -723,7 +775,14 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
             if snap_bl_path.exists():
                 with open(snap_bl_path, "r", encoding="utf-8") as f:
                     snap_bl = json.load(f)
-                latest_snap_files = snap_bl.get("files", {})
+                snap_algorithm = snap_bl.get("algorithm", HASH_ALGORITHM)
+                if snap_algorithm == algorithm:
+                    latest_snap_files = snap_bl.get("files", {})
+                else:
+                    log.warn(
+                        f"最新快照使用 {snap_algorithm}，与当前配置 {algorithm} 不一致，"
+                        "已跳过该快照作为修复依据。"
+                    )
 
     repaired = 0
     skipped = 0
@@ -737,111 +796,141 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     for rel in sorted(all_files):
         b_hash = baseline_files.get(rel, {}).get("hash")
         m_hash = master_files.get(rel, {}).get("hash")
-
-        mirror_hashes = {}
-        for name, mfiles in mirrors.items():
-            if rel in mfiles:
-                mirror_hashes[name] = mfiles[rel].get("hash")
-
         snap_hash = latest_snap_files.get(rel, {}).get("hash")
+
+        current_entries = {
+            "主副本": {
+                "hash": m_hash,
+                "path": master_dir / rel,
+            }
+        }
+        for name in get_mirror_names():
+            current_entries[name] = {
+                "hash": mirrors[name].get(rel, {}).get("hash"),
+                "path": archive_root / MIRRORS_DIR / name / rel,
+            }
 
         # 检查镜像缺失情况
         missing_mirrors = []
-        for name in mirrors:
-            if rel not in mirrors[name] and (rel in baseline_files or rel in master_files):
+        for name in get_mirror_names():
+            if current_entries[name]["hash"] is None and (rel in baseline_files or rel in master_files):
                 missing_mirrors.append(name)
 
-        # 收集所有有效哈希及来源
-        sources = {}
-        if m_hash:
-            sources["主副本"] = m_hash
-        for name, h in mirror_hashes.items():
-            if h:
-                sources[name] = h
+        # 主副本和基准都已不存在，但镜像里还残留的文件：显式清理
+        orphan_mirrors = [
+            name for name in get_mirror_names()
+            if current_entries[name]["hash"] is not None
+            and rel not in baseline_files
+            and rel not in master_files
+        ]
+        if orphan_mirrors:
+            log.info(f"  发现镜像残留文件: {rel}")
+            for name in orphan_mirrors:
+                target_path = current_entries[name]["path"]
+                log.info(f"    → 清理 {name}: {rel}")
+                if not dry_run:
+                    try:
+                        if target_path.exists():
+                            try:
+                                os.chmod(str(target_path), stat.S_IWRITE | stat.S_IREAD)
+                            except OSError:
+                                pass
+                            target_path.unlink()
+                        repaired += 1
+                    except OSError as e:
+                        log.error(f"    清理失败: {rel} ({name}) — {e}")
+                        errors += 1
+                else:
+                    repaired += 1
+            continue
+
+        current_hashes = {
+            name: entry["hash"]
+            for name, entry in current_entries.items()
+            if entry["hash"] is not None
+        }
+        if not current_hashes and not b_hash and not snap_hash:
+            log.debug(f"  跳过 {rel}: 无任何有效数据源")
+            continue
+
+        sources = {**current_hashes}
         if snap_hash:
             sources["快照"] = snap_hash
         if b_hash:
             sources["基准"] = b_hash
 
-        if not sources:
-            log.debug(f"  跳过 {rel}: 无任何有效数据源")
-            continue
+        current_unique_hashes = set(current_hashes.values())
+        history_hashes = [h for h in (b_hash, snap_hash) if h is not None]
 
-        # 所有源一致 且 无缺失 — 无事可做
-        unique_hashes = set(sources.values())
-        if len(unique_hashes) == 1 and not missing_mirrors:
-            continue
-
-        # 有不一致或缺失 — 判定
         if missing_mirrors:
             log.info(f"  发现缺失: {rel} (在 {', '.join(missing_mirrors)} 中)")
-        if len(unique_hashes) > 1:
-            log.info(f"  发现不一致: {rel}")
+        if len(current_unique_hashes) > 1:
+            log.info(f"  发现当前链不一致: {rel}")
+        elif history_hashes and current_unique_hashes:
+            only_current_hash = next(iter(current_unique_hashes))
+            if any(h != only_current_hash for h in history_hashes):
+                log.info(f"  发现当前链与历史记录冲突: {rel}")
         for src, h in sources.items():
             log.debug(f"    {src}: {h[:16]}...")
 
-        # 投票：哪个哈希出现最多次
-        hash_votes = {}
-        for src, h in sources.items():
-            hash_votes.setdefault(h, []).append(src)
+        auto_repair_reason = None
+        anchor_hash = None
+        source_name = None
 
-        # 排序：票数多的优先，基准权重加成
-        best_hash = None
-        best_score = -1
-        for h, voters in hash_votes.items():
-            score = len(voters)
-            if "基准" in voters:
-                score += 0.5  # 基准有额外权重
-            if "主副本" in voters:
-                score += 0.5  # 主副本有额外权重
-            if score > best_score:
-                best_score = score
-                best_hash = h
+        # 当前链完全一致且无缺失，且与历史记录无冲突：无需处理
+        if current_unique_hashes:
+            current_only_hash = next(iter(current_unique_hashes)) if len(current_unique_hashes) == 1 else None
+            current_targets = [
+                name for name, entry in current_entries.items()
+                if entry["hash"] != current_only_hash
+            ] if current_only_hash else []
+            history_conflict = current_only_hash is not None and any(
+                h != current_only_hash for h in history_hashes
+            )
+            if current_only_hash is not None and not current_targets and not history_conflict:
+                continue
 
-        # 判定是否可以自动修复
-        majority_voters = hash_votes[best_hash]
-        minority_count = len(sources) - len(majority_voters)
+        # 规则 1：当前链现存副本本来就一致，只是镜像缺失/不可读 —— 直接补镜像
+        if m_hash is not None and len(current_unique_hashes) == 1:
+            mirror_targets = [
+                name for name in get_mirror_names()
+                if current_entries[name]["hash"] != m_hash
+            ]
+            if mirror_targets:
+                anchor_hash = m_hash
+                source_name = "主副本"
+                auto_repair_reason = "当前链一致，可直接恢复镜像"
 
-        can_auto_repair = False
-        repair_source = None
+        # 规则 2：历史证据支持某一个当前版本 —— 用该版本修复其他副本
+        if anchor_hash is None and current_hashes:
+            history_supported_hashes = {}
+            if b_hash and b_hash in current_unique_hashes:
+                history_supported_hashes.setdefault(b_hash, []).append("基准")
+            if snap_hash and snap_hash in current_unique_hashes:
+                history_supported_hashes.setdefault(snap_hash, []).append("快照")
 
-        if len(unique_hashes) == 1 and missing_mirrors:
-            # 所有现存源一致，只是部分镜像缺失 — 安全修复
-            can_auto_repair = True
-            if m_hash:
-                repair_source = ("主副本", master_dir / rel)
-            else:
-                for name, h in mirror_hashes.items():
-                    if h == best_hash:
-                        repair_source = (name, archive_root / MIRRORS_DIR / name / rel)
-                        break
-                if not repair_source and snap_hash == best_hash and latest_snapshot:
-                    repair_source = ("快照", latest_snapshot / rel)
-        elif minority_count == 0:
-            # 不应到这里
-            continue
-        elif len(majority_voters) >= 2:
-            # 多数一致，可以修复少数
-            can_auto_repair = True
-            # 选修复源：优先主副本，其次镜像
-            if "主副本" in majority_voters and m_hash == best_hash:
-                repair_source = ("主副本", master_dir / rel)
-            else:
-                for name in majority_voters:
-                    if name.startswith("mirror_"):
-                        repair_source = (name, archive_root / MIRRORS_DIR / name / rel)
-                        break
-                if not repair_source and "快照" in majority_voters:
-                    repair_source = ("快照", latest_snapshot / rel)
-        elif len(sources) == 2:
-            # 只有两个源且不一致，无法投票判定
-            can_auto_repair = False
-        else:
-            # 其他复杂情况
-            can_auto_repair = False
+            if len(history_supported_hashes) == 1:
+                anchor_hash, supported_by = next(iter(history_supported_hashes.items()))
+                supporters = [
+                    name for name, h in current_hashes.items()
+                    if h == anchor_hash
+                ]
+                source_name = choose_current_source_name(supporters)
+                auto_repair_reason = f"{'、'.join(supported_by)}支持当前版本"
+            elif len(history_supported_hashes) > 1:
+                auto_repair_reason = None
 
-        if not can_auto_repair:
+        if anchor_hash is None or source_name is None:
+            manual_reason = "当前副本之间存在冲突，且历史证据不足以支持唯一版本"
+            if current_unique_hashes and len(current_unique_hashes) == 1 and history_hashes:
+                manual_reason = "当前链虽然一致，但与基准或快照冲突，需要人工确认"
+            elif not current_hashes and (b_hash or snap_hash):
+                manual_reason = "缺少可用的现存副本，无法安全恢复"
+            elif b_hash and snap_hash and b_hash != snap_hash and b_hash in current_unique_hashes and snap_hash in current_unique_hashes:
+                manual_reason = "基准和快照分别支持不同的当前版本，需要人工确认"
+
             log.warn(f"  无法自动判定 {rel} 的正确版本，需要人工介入。")
+            log.warn(f"    原因: {manual_reason}")
             log.warn(f"    各源哈希:")
             for src, h in sources.items():
                 log.warn(f"      {src}: {h[:16]}...")
@@ -849,20 +938,14 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
             skipped += 1
             continue
 
-        # 执行修复
-        src_name, src_path = repair_source
-        log.info(f"  修复依据: {src_name} (多数一致)")
+        src_path = get_current_copy_path(archive_root, master_dir, source_name, rel)
+        log.info(f"  修复依据: {source_name} ({auto_repair_reason})")
 
-        targets_to_fix = []
-        if m_hash != best_hash and "主副本" not in majority_voters:
-            targets_to_fix.append(("主副本", master_dir / rel))
-        for name, h in mirror_hashes.items():
-            if h != best_hash:
-                targets_to_fix.append((name, archive_root / MIRRORS_DIR / name / rel))
-
-        # 镜像缺失的文件
-        for name in missing_mirrors:
-            targets_to_fix.append((name, archive_root / MIRRORS_DIR / name / rel))
+        targets_to_fix = [
+            (name, entry["path"])
+            for name, entry in current_entries.items()
+            if entry["hash"] != anchor_hash
+        ]
 
         for target_name, target_path in targets_to_fix:
             log.info(f"    → 修复 {target_name}: {rel}")
@@ -877,8 +960,8 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
                             pass
                     shutil.copy2(str(src_path), str(target_path))
                     # 验证
-                    verify_hash = compute_file_hash(target_path)
-                    if verify_hash != best_hash:
+                    verify_hash = compute_file_hash(target_path, algorithm)
+                    if verify_hash != anchor_hash:
                         log.error(f"    修复后验证失败: {rel} ({target_name})")
                         errors += 1
                     else:
@@ -903,14 +986,13 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         # 修复后复检
         log.info("")
         log.info("修复后复检...")
-        post_master = scan_directory(master_dir, ignore)
+        post_master = scan_directory(master_dir, ignore, algorithm)
         recheck_ok = True
-        for i in range(1, mirror_count + 1):
-            name = f"mirror_{i}"
+        for name in get_mirror_names():
             mdir = archive_root / MIRRORS_DIR / name
             if not mdir.exists():
                 continue
-            post_mirror = scan_directory(mdir, ignore)
+            post_mirror = scan_directory(mdir, ignore, algorithm)
             for rel in post_master:
                 if rel in post_mirror:
                     if post_master[rel]["hash"] != post_mirror[rel]["hash"]:
@@ -931,11 +1013,13 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
 def cmd_status(archive_root: Path, log: ArchiveLogger):
     """快速状态查看"""
     config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
 
     log.info(f"{PROGRAM_NAME} v{VERSION}")
     log.info(f"归档目录: {archive_root}")
+    log.info(f"哈希算法: {algorithm}")
     log.info("")
 
     # 主副本
@@ -946,9 +1030,7 @@ def cmd_status(archive_root: Path, log: ArchiveLogger):
         log.info("主副本: 目录不存在")
 
     # 镜像
-    mirror_count = config.get("mirror_count", 1)
-    for i in range(1, mirror_count + 1):
-        name = f"mirror_{i}"
+    for name in get_mirror_names():
         mdir = archive_root / MIRRORS_DIR / name
         if mdir.exists():
             mc = len(scan_directory_fast(mdir, ignore))
@@ -1049,7 +1131,7 @@ def cmd_maintain(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        prog="archive_keeper",
+        prog="vault",
         description=f"{PROGRAM_NAME} v{VERSION} — 单盘多副本归档维护工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -1063,9 +1145,9 @@ def main():
   status    查看状态
 
 示例:
-  python archive_keeper.py init D:\\我的归档
-  python archive_keeper.py maintain D:\\我的归档
-  python archive_keeper.py maintain D:\\我的归档 --dry-run
+  python vault.py init D:\\我的归档
+  python vault.py maintain D:\\我的归档
+  python vault.py maintain D:\\我的归档 --dry-run
 """)
     parser.add_argument("command",
                         choices=["init", "sync", "verify", "snapshot",
@@ -1082,7 +1164,7 @@ def main():
 
     # init 不需要预先存在的配置
     if command != "init" and not (archive_root / SYSTEM_DIR / CONFIG_FILE).exists():
-        print(f"错误: {archive_root} 尚未初始化。请先运行: python archive_keeper.py init {archive_root}")
+        print(f"错误: {archive_root} 尚未初始化。请先运行: python vault.py init {archive_root}")
         sys.exit(1)
 
     log = ArchiveLogger(archive_root, command)
