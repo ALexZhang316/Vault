@@ -12,7 +12,10 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+from unittest import mock
 from pathlib import Path
+
+import vault
 
 SCRIPT = str(Path(__file__).parent / "vault.py")
 PYTHON = sys.executable
@@ -337,6 +340,30 @@ def main():
 
     ok, out = run_cmd("verify", archive_root=algo_root)
     test("blake2b 配置下 verify 通过", ok, out)
+
+    # ==========================================
+    # 测试 16: baseline 保存采用原子替换
+    # ==========================================
+    print("\n--- 测试组 16: baseline 原子替换 ---")
+    atomic_root = TEST_ROOT / "_atomic_case"
+    ok, out = run_cmd("init", archive_root=atomic_root)
+    test("原子替换用例初始化成功", ok, out)
+
+    atomic_baseline = {
+        "created": "2026-03-26T14:00:00",
+        "algorithm": "sha256",
+        "files": {
+            "atomic.txt": {
+                "hash": "abc123",
+                "size": 7,
+            }
+        },
+    }
+    with mock.patch("pathlib.Path.unlink", side_effect=AssertionError("save_baseline should not unlink the existing file")):
+        vault.save_baseline(atomic_root, atomic_baseline)
+
+    saved_baseline = json.loads((atomic_root / ".archive" / "baseline.json").read_text(encoding="utf-8"))
+    test("save_baseline 不依赖先删除旧文件", saved_baseline == atomic_baseline)
 
     # ==========================================
     # 汇总

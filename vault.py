@@ -327,13 +327,21 @@ def load_baseline(archive_root: Path) -> dict:
 
 def save_baseline(archive_root: Path, baseline: dict):
     bp = archive_root / SYSTEM_DIR / BASELINE_FILE
-    # 先写临时文件再替换，防止写到一半断电
+    bp.parent.mkdir(parents=True, exist_ok=True)
+    # 先写临时文件，再用同目录原子替换，避免旧基准短暂消失
     tmp = bp.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(baseline, f, ensure_ascii=False, indent=2)
-    if bp.exists():
-        bp.unlink()
-    tmp.rename(bp)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(baseline, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, bp)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ============================================================
