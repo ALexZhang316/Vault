@@ -272,11 +272,28 @@ def main():
     # 测试 11: 统一维护流程
     # ==========================================
     print("\n--- 测试组 11: 统一维护 maintain ---")
-    # 先恢复干净
+    # 显式同步已确认的正常修改，再执行日常维护
     write_file(TEST_ROOT / "master" / "notes.txt", "维护测试最终版本")
+    run_cmd("sync")
+    maintain_snapshots_before = len(vault.list_published_snapshots(TEST_ROOT))
     ok, out = run_cmd("maintain")
     test("maintain 命令完成", ok, out)
     test("maintain 输出包含汇总", "汇总" in out or "总体状态" in out, out[:500])
+    test("maintain 完整执行安全门和四个步骤",
+         all(marker in out for marker in [
+             "【安全门】", "【步骤 1/4】", "【步骤 2/4】",
+             "【步骤 3/4】", "【步骤 4/4】",
+         ]), out[:1000])
+    test("maintain 发布一个完整快照",
+         len(vault.list_published_snapshots(TEST_ROOT)) == maintain_snapshots_before + 1)
+    maintained_baseline = json.loads(
+        (TEST_ROOT / ".archive" / "baseline.json").read_text(encoding="utf-8")
+    )
+    maintained_hash = hashlib.sha256("维护测试最终版本".encode("utf-8")).hexdigest()
+    test("maintain 后 master、镜像和 baseline 一致",
+         maintained_baseline["files"]["notes.txt"]["hash"] == maintained_hash
+         and all(read_file(TEST_ROOT / "mirrors" / name / "notes.txt") == "维护测试最终版本"
+                 for name in ["mirror_1", "mirror_2"]))
 
     # ==========================================
     # 测试 12: 幂等性 — 重复运行稳定
@@ -359,11 +376,291 @@ def main():
             }
         },
     }
-    with mock.patch("pathlib.Path.unlink", side_effect=AssertionError("save_baseline should not unlink the existing file")):
+    real_replace = os.replace
+    with mock.patch(
+        "pathlib.Path.unlink",
+        side_effect=AssertionError("save_baseline should not unlink the existing file"),
+    ), mock.patch("vault.os.replace", wraps=real_replace) as replace_mock:
         vault.save_baseline(atomic_root, atomic_baseline)
 
     saved_baseline = json.loads((atomic_root / ".archive" / "baseline.json").read_text(encoding="utf-8"))
-    test("save_baseline 不依赖先删除旧文件", saved_baseline == atomic_baseline)
+    replace_source, replace_target = map(Path, replace_mock.call_args.args)
+    replacement_baseline = {**atomic_baseline, "updated": "2026-03-26T14:01:00"}
+    replace_failed = False
+    try:
+        with mock.patch("vault.os.replace", side_effect=OSError("injected baseline replace failure")):
+            vault.save_baseline(atomic_root, replacement_baseline)
+    except OSError:
+        replace_failed = True
+
+    test("save_baseline 不依赖先删除旧文件",
+         saved_baseline == atomic_baseline
+         and replace_mock.call_count == 1
+         and replace_source.parent == replace_target.parent
+         and replace_source == replace_target.with_suffix(".tmp")
+         and replace_target.name == "baseline.json"
+         and replace_failed
+         and json.loads(replace_target.read_text(encoding="utf-8")) == atomic_baseline
+         and not replace_source.exists())
+
+    # ==========================================
+    # 测试 17: maintain 不传播 master 删除
+    # ==========================================
+    print("\n--- 测试组 17: maintain 删除安全门 ---")
+    delete_root = TEST_ROOT / "_maintain_delete_case"
+    run_cmd("init", archive_root=delete_root)
+    write_file(delete_root / "master" / "protected.txt", "GOOD DATA")
+    write_file(delete_root / "master" / "stable.txt", "STABLE DATA")
+    run_cmd("sync", archive_root=delete_root)
+    baseline_before = (delete_root / ".archive" / "baseline.json").read_bytes()
+    snapshots_before = {d.name for d in (delete_root / "snapshots").iterdir() if d.is_dir()}
+
+    (delete_root / "master" / "protected.txt").unlink()
+    ok, out = run_cmd("maintain", archive_root=delete_root, expect_fail=True)
+    test("master 删除后 maintain 会停止", ok, out)
+    test("删除安全门给出停止说明", "维护已停止" in out, out[:500])
+    test("maintain 不删除两份正常镜像",
+         all(read_file(delete_root / "mirrors" / name / "protected.txt") == "GOOD DATA"
+             for name in ["mirror_1", "mirror_2"]))
+    test("maintain 不移除删除文件的 baseline 记录",
+         (delete_root / ".archive" / "baseline.json").read_bytes() == baseline_before)
+    snapshots_after = {d.name for d in (delete_root / "snapshots").iterdir() if d.is_dir()}
+    test("删除安全门前不创建快照", snapshots_after == snapshots_before)
+
+    run_cmd("sync", archive_root=delete_root)
+    ok, out = run_cmd("maintain", archive_root=delete_root)
+    test("显式 sync 后 maintain 仍不自动清理镜像", ok, out)
+    test("maintain 的警告流程继续保留两份镜像",
+         all(read_file(delete_root / "mirrors" / name / "protected.txt") == "GOOD DATA"
+             for name in ["mirror_1", "mirror_2"]))
+    test("镜像清理要求显式 repair", "显式运行 repair --dry-run" in out, out[:500])
+    test("删除待确认流程汇总为警告", "总体状态: 警告" in out, out[:1000])
+
+    real_cmd_sync = vault.cmd_sync
+
+    def sync_then_inject_mirror_error(archive_root, log, dry_run=False):
+        status = real_cmd_sync(archive_root, log, dry_run)
+        write_file(archive_root / "mirrors" / "mirror_1" / "stable.txt", "BROKEN MIRROR")
+        return status
+
+    conditional_log = vault.ArchiveLogger(delete_root, "maintain_conditional_error")
+    with mock.patch("vault.cmd_sync", side_effect=sync_then_inject_mirror_error):
+        conditional_status = vault.cmd_maintain(delete_root, conditional_log)
+
+    test("其他严重问题触发内部 repair 时仍不清理 orphan",
+         conditional_status == vault.STATUS_ERROR
+         and all(read_file(delete_root / "mirrors" / name / "protected.txt") == "GOOD DATA"
+                 for name in ["mirror_1", "mirror_2"]))
+    test("内部 repair 仍会修复非删除类问题",
+         read_file(delete_root / "mirrors" / "mirror_1" / "stable.txt") == "STABLE DATA")
+
+    # ==========================================
+    # 测试 18: maintain 不传播 master 静默损坏
+    # ==========================================
+    print("\n--- 测试组 18: maintain 损坏安全门 ---")
+    corrupt_root = TEST_ROOT / "_maintain_corrupt_case"
+    run_cmd("init", archive_root=corrupt_root)
+    write_file(corrupt_root / "master" / "tracked.txt", "KNOWN GOOD")
+    run_cmd("sync", archive_root=corrupt_root)
+    corrupt_baseline_before = (corrupt_root / ".archive" / "baseline.json").read_bytes()
+    corrupt_snapshots_before = {
+        d.name for d in (corrupt_root / "snapshots").iterdir() if d.is_dir()
+    }
+
+    write_file(corrupt_root / "master" / "tracked.txt", "SILENT CORRUPTION")
+    ok, out = run_cmd("maintain", archive_root=corrupt_root, expect_fail=True)
+    test("master 内容异常后 maintain 会停止", ok, out)
+    test("损坏不会覆盖两份正常镜像",
+         all(read_file(corrupt_root / "mirrors" / name / "tracked.txt") == "KNOWN GOOD"
+             for name in ["mirror_1", "mirror_2"]))
+    test("损坏不会更新 baseline",
+         (corrupt_root / ".archive" / "baseline.json").read_bytes() == corrupt_baseline_before)
+    corrupt_snapshots_after = {
+        d.name for d in (corrupt_root / "snapshots").iterdir() if d.is_dir()
+    }
+    test("损坏内容不会生成新快照", corrupt_snapshots_after == corrupt_snapshots_before)
+    test("损坏场景不会报告全部通过", "总体状态: 通过" not in out, out[:500])
+
+    # ==========================================
+    # 测试 19: 失败快照不发布、不淘汰
+    # ==========================================
+    print("\n--- 测试组 19: 快照原子发布 ---")
+    snapshot_root = TEST_ROOT / "_snapshot_atomic_case"
+    run_cmd("init", archive_root=snapshot_root)
+    snapshot_config_path = snapshot_root / ".archive" / "config.json"
+    snapshot_config = json.loads(snapshot_config_path.read_text(encoding="utf-8"))
+    snapshot_config["max_snapshots"] = 1
+    snapshot_config["snapshot_readonly"] = False
+    snapshot_config_path.write_text(
+        json.dumps(snapshot_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    write_file(snapshot_root / "master" / "good.txt", "GOOD")
+    write_file(snapshot_root / "master" / "fail.txt", "COMPLETE CONTENT")
+
+    initial_log = vault.ArchiveLogger(snapshot_root, "snapshot_initial")
+    initial_status = vault.cmd_snapshot(snapshot_root, initial_log)
+    original_snapshots = vault.list_published_snapshots(snapshot_root)
+    test("初始正常快照创建成功",
+         initial_status == vault.STATUS_OK and len(original_snapshots) == 1)
+    original_snapshot = original_snapshots[0]
+    original_copy2 = vault.shutil.copy2
+
+    def visible_snapshot_entries():
+        return {
+            path.name for path in (snapshot_root / "snapshots").iterdir()
+            if not path.name.startswith(".")
+        }
+
+    original_visible_entries = visible_snapshot_entries()
+
+    def fail_one_snapshot_copy(src, dst):
+        if Path(src).name == "fail.txt":
+            raise OSError("injected snapshot copy failure")
+        return original_copy2(src, dst)
+
+    failed_log = vault.ArchiveLogger(snapshot_root, "snapshot_copy_failure")
+    with mock.patch("vault.shutil.copy2", side_effect=fail_one_snapshot_copy):
+        failed_status = vault.cmd_snapshot(snapshot_root, failed_log)
+
+    test("快照复制异常返回需要处理", failed_status == vault.STATUS_ERROR)
+    test("复制异常不发布半快照",
+         visible_snapshot_entries() == original_visible_entries
+         and vault.list_published_snapshots(snapshot_root) == [original_snapshot])
+    test("复制异常不淘汰旧正常快照", original_snapshot.is_dir())
+    test("复制异常会清理暂存目录",
+         not any(d.name.startswith(vault.SNAPSHOT_STAGING_PREFIX)
+                 for d in (snapshot_root / "snapshots").iterdir() if d.is_dir()))
+
+    def truncate_one_snapshot_copy(src, dst):
+        if Path(src).name == "fail.txt":
+            Path(dst).write_bytes(b"truncated")
+            return str(dst)
+        return original_copy2(src, dst)
+
+    truncated_log = vault.ArchiveLogger(snapshot_root, "snapshot_truncated_copy")
+    with mock.patch("vault.shutil.copy2", side_effect=truncate_one_snapshot_copy):
+        truncated_status = vault.cmd_snapshot(snapshot_root, truncated_log)
+
+    test("快照静默截断会被哈希校验阻止", truncated_status == vault.STATUS_ERROR)
+    test("静默截断后旧正常快照仍保留",
+         visible_snapshot_entries() == original_visible_entries
+         and vault.list_published_snapshots(snapshot_root) == [original_snapshot])
+
+    manifest_log = vault.ArchiveLogger(snapshot_root, "snapshot_manifest_failure")
+    with mock.patch("vault.os.fsync", side_effect=OSError("injected manifest fsync failure")):
+        manifest_status = vault.cmd_snapshot(snapshot_root, manifest_log)
+
+    test("快照清单落盘失败会阻止发布", manifest_status == vault.STATUS_ERROR)
+    test("清单落盘失败不新增公开目录且不淘汰旧快照",
+         visible_snapshot_entries() == original_visible_entries
+         and original_snapshot.is_dir()
+         and not any(path.name.startswith(vault.SNAPSHOT_STAGING_PREFIX)
+                     for path in (snapshot_root / "snapshots").iterdir()))
+
+    publish_log = vault.ArchiveLogger(snapshot_root, "snapshot_publish_failure")
+    with mock.patch("vault.os.replace", side_effect=OSError("injected snapshot publish failure")):
+        publish_status = vault.cmd_snapshot(snapshot_root, publish_log)
+
+    test("快照原子发布失败会返回需要处理", publish_status == vault.STATUS_ERROR)
+    test("原子发布失败不新增公开目录且不淘汰旧快照",
+         visible_snapshot_entries() == original_visible_entries
+         and original_snapshot.is_dir()
+         and not any(path.name.startswith(vault.SNAPSHOT_STAGING_PREFIX)
+                     for path in (snapshot_root / "snapshots").iterdir()))
+
+    def walk_with_access_error(top, *args, **kwargs):
+        kwargs["onerror"](PermissionError("injected directory enumeration failure"))
+        return iter(())
+
+    scan_log = vault.ArchiveLogger(snapshot_root, "snapshot_scan_failure")
+    with mock.patch("vault.os.walk", side_effect=walk_with_access_error):
+        scan_status = vault.cmd_snapshot(snapshot_root, scan_log)
+
+    test("主副本目录枚举失败会阻止快照", scan_status == vault.STATUS_ERROR)
+    test("目录枚举失败不发布快照也不淘汰旧快照",
+         visible_snapshot_entries() == original_visible_entries
+         and original_snapshot.is_dir())
+
+    replacement_log = vault.ArchiveLogger(snapshot_root, "snapshot_replacement")
+    replacement_status = vault.cmd_snapshot(snapshot_root, replacement_log)
+    replacement_snapshots = vault.list_published_snapshots(snapshot_root)
+    test("完整新快照成功后才执行淘汰",
+         replacement_status == vault.STATUS_OK
+         and len(replacement_snapshots) == 1
+         and replacement_snapshots[0] != original_snapshot
+         and not original_snapshot.exists())
+    test("发布快照的 baseline 与实际文件完整匹配",
+         vault.load_valid_snapshot_baseline(
+             replacement_snapshots[0],
+             expected_algorithm="sha256",
+             verify_hashes=True,
+         ) is not None)
+
+    # ==========================================
+    # 测试 20: 同步失败不推进 baseline
+    # ==========================================
+    print("\n--- 测试组 20: 同步提交边界 ---")
+    sync_failure_root = TEST_ROOT / "_sync_failure_case"
+    run_cmd("init", archive_root=sync_failure_root)
+    write_file(sync_failure_root / "master" / "tracked.txt", "VERSION 1")
+    run_cmd("sync", archive_root=sync_failure_root)
+    sync_baseline_before = (sync_failure_root / ".archive" / "baseline.json").read_bytes()
+    write_file(sync_failure_root / "master" / "tracked.txt", "VERSION 2")
+
+    def fail_second_mirror(src, dst):
+        if "mirror_2" in Path(dst).parts:
+            raise OSError("injected mirror copy failure")
+        return original_copy2(src, dst)
+
+    sync_failure_log = vault.ArchiveLogger(sync_failure_root, "sync_failure")
+    with mock.patch("vault.shutil.copy2", side_effect=fail_second_mirror):
+        sync_failure_status = vault.cmd_sync(sync_failure_root, sync_failure_log)
+
+    test("任一镜像同步失败会返回需要处理", sync_failure_status == vault.STATUS_ERROR)
+    test("任一镜像同步失败时 baseline 保持不变",
+         (sync_failure_root / ".archive" / "baseline.json").read_bytes() == sync_baseline_before)
+
+    # ==========================================
+    # 测试 21: baseline 缺失或损坏时安全停止
+    # ==========================================
+    print("\n--- 测试组 21: baseline 完整性门禁 ---")
+    missing_baseline_root = TEST_ROOT / "_missing_baseline_case"
+    run_cmd("init", archive_root=missing_baseline_root)
+    write_file(missing_baseline_root / "master" / "tracked.txt", "KNOWN GOOD")
+    run_cmd("sync", archive_root=missing_baseline_root)
+    missing_baseline_path = missing_baseline_root / ".archive" / "baseline.json"
+    missing_snapshots_before = {
+        path.name for path in (missing_baseline_root / "snapshots").iterdir()
+    }
+    missing_baseline_path.unlink()
+    write_file(missing_baseline_root / "master" / "tracked.txt", "CORRUPTED")
+
+    ok, out = run_cmd("maintain", archive_root=missing_baseline_root, expect_fail=True)
+    test("baseline 缺失时 maintain 会停止", ok and "校验基准不可用" in out, out[:1000])
+    test("baseline 缺失时损坏不会传播到镜像",
+         all(read_file(missing_baseline_root / "mirrors" / name / "tracked.txt") == "KNOWN GOOD"
+             for name in ["mirror_1", "mirror_2"]))
+    test("baseline 缺失时不创建快照也不重建基准",
+         not missing_baseline_path.exists()
+         and {path.name for path in (missing_baseline_root / "snapshots").iterdir()}
+         == missing_snapshots_before)
+
+    (missing_baseline_root / "master" / "tracked.txt").unlink()
+    ok, out = run_cmd("repair", archive_root=missing_baseline_root, expect_fail=True)
+    test("baseline 缺失时 repair 不会把镜像误判为 orphan",
+         ok and all((missing_baseline_root / "mirrors" / name / "tracked.txt").is_file()
+                    for name in ["mirror_1", "mirror_2"]), out[:1000])
+
+    missing_baseline_path.write_text(
+        json.dumps({"algorithm": "sha256"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    ok, out = run_cmd("maintain", archive_root=missing_baseline_root, expect_fail=True)
+    test("baseline schema 不完整时 maintain 同样停止",
+         ok and "缺少 files" in out
+         and all((missing_baseline_root / "mirrors" / name / "tracked.txt").is_file()
+                 for name in ["mirror_1", "mirror_2"]), out[:1000])
 
     # ==========================================
     # 汇总

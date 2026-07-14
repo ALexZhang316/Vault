@@ -24,7 +24,6 @@ import os
 import shutil
 import stat
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +38,8 @@ BASELINE_FILE = "baseline.json"
 MASTER_DIR = "master"
 MIRRORS_DIR = "mirrors"
 SNAPSHOTS_DIR = "snapshots"
+SNAPSHOT_BASELINE_FILE = "_snapshot_baseline.json"
+SNAPSHOT_STAGING_PREFIX = ".pending_"
 LOGS_DIR = "logs"
 REPORTS_DIR = "reports"
 FIXED_MIRROR_COUNT = 2
@@ -224,6 +225,11 @@ class ArchiveLogger:
 # ============================================================
 # 文件扫描工具
 # ============================================================
+def raise_directory_scan_error(error: OSError):
+    """让 os.walk 的目录枚举错误进入调用方的失败处理。"""
+    raise error
+
+
 def should_ignore(rel_path: str, ignore_patterns: list) -> bool:
     """检查相对路径是否匹配忽略规则"""
     parts = rel_path.replace("\\", "/").split("/")
@@ -243,7 +249,7 @@ def scan_directory(base_dir: Path, ignore_patterns: list, algorithm: str = HASH_
     result = {}
     if not base_dir.exists():
         return result
-    for root, dirs, files in os.walk(base_dir):
+    for root, dirs, files in os.walk(base_dir, onerror=raise_directory_scan_error):
         # 过滤忽略目录
         dirs[:] = [d for d in dirs
                    if not should_ignore(
@@ -276,7 +282,7 @@ def scan_directory_fast(base_dir: Path, ignore_patterns: list) -> set:
     result = set()
     if not base_dir.exists():
         return result
-    for root, dirs, files in os.walk(base_dir):
+    for root, dirs, files in os.walk(base_dir, onerror=raise_directory_scan_error):
         dirs[:] = [d for d in dirs
                    if not should_ignore(
                        os.path.relpath(os.path.join(root, d), base_dir),
@@ -288,6 +294,70 @@ def scan_directory_fast(base_dir: Path, ignore_patterns: list) -> set:
                 continue
             result.add(rel)
     return result
+
+
+def load_valid_snapshot_baseline(snapshot_dir: Path,
+                                 expected_algorithm: Optional[str] = None,
+                                 verify_hashes: bool = False) -> Optional[dict]:
+    """读取并验证快照清单；文件集合或内容不完整时返回 None。"""
+    baseline_path = snapshot_dir / SNAPSHOT_BASELINE_FILE
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            baseline = json.load(f)
+        algorithm = validate_hash_algorithm(baseline.get("algorithm", HASH_ALGORITHM))
+        files = baseline.get("files")
+        if not isinstance(files, dict):
+            return None
+        if expected_algorithm is not None and algorithm != expected_algorithm:
+            return None
+
+        actual_files = scan_directory_fast(snapshot_dir, [])
+        actual_files.discard(SNAPSHOT_BASELINE_FILE)
+        if actual_files != set(files.keys()):
+            return None
+
+        for rel, info in files.items():
+            if not isinstance(info, dict):
+                return None
+            file_path = snapshot_dir / rel
+            if file_path.stat().st_size != info.get("size"):
+                return None
+            if verify_hashes:
+                expected_hash = info.get("hash")
+                if not expected_hash or compute_file_hash(file_path, algorithm) != expected_hash:
+                    return None
+        return baseline
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def list_published_snapshots(archive_root: Path) -> list[Path]:
+    """列出已发布且文件集合完整的快照，忽略暂存和不完整目录。"""
+    snapshots_root = archive_root / SNAPSHOTS_DIR
+    if not snapshots_root.exists():
+        return []
+
+    snapshots = []
+    for snapshot_dir in snapshots_root.iterdir():
+        if not snapshot_dir.is_dir() or snapshot_dir.name.startswith("."):
+            continue
+        if load_valid_snapshot_baseline(snapshot_dir) is not None:
+            snapshots.append(snapshot_dir)
+    return sorted(snapshots)
+
+
+def remove_tree_writable(path: Path):
+    """去掉树内文件的只读属性后删除目录。"""
+    if not path.exists():
+        return
+    for root, dirs, files in os.walk(path):
+        for fname in files:
+            fpath = Path(root) / fname
+            try:
+                os.chmod(str(fpath), stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+    shutil.rmtree(str(path))
 
 
 def get_mirror_names() -> list[str]:
@@ -323,6 +393,33 @@ def load_baseline(archive_root: Path) -> dict:
         return {}
     with open(bp, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_required_baseline(archive_root: Path) -> dict:
+    """读取可信基准；缺失或 schema 不完整时拒绝继续。"""
+    baseline_path = archive_root / SYSTEM_DIR / BASELINE_FILE
+    if not baseline_path.is_file():
+        raise FileNotFoundError(f"校验基准不存在: {baseline_path}")
+
+    baseline = load_baseline(archive_root)
+    if not isinstance(baseline, dict):
+        raise ValueError("校验基准格式无效：根节点必须是对象")
+    algorithm = baseline.get("algorithm")
+    files = baseline.get("files")
+    if not isinstance(algorithm, str):
+        raise ValueError("校验基准格式无效：缺少 algorithm")
+    validate_hash_algorithm(algorithm)
+    if not isinstance(files, dict):
+        raise ValueError("校验基准格式无效：缺少 files")
+
+    for rel, info in files.items():
+        rel_path = Path(rel) if isinstance(rel, str) else None
+        if (rel_path is None or not rel or rel_path.is_absolute() or ".." in rel_path.parts
+                or not isinstance(info, dict)
+                or not isinstance(info.get("hash"), str) or not info["hash"]
+                or not isinstance(info.get("size"), int) or info["size"] < 0):
+            raise ValueError(f"校验基准格式无效：文件记录不完整 ({rel})")
+    return baseline
 
 
 def save_baseline(archive_root: Path, baseline: dict):
@@ -413,6 +510,14 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         log.error(f"主副本目录不存在: {master_dir}")
         return STATUS_ERROR
 
+    try:
+        baseline = load_baseline(archive_root)
+        if not isinstance(baseline, dict):
+            raise ValueError("根节点必须是对象")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.warn(f"现有校验基准不可读取，将在完整同步成功后重建: {e}")
+        baseline = {}
+
     mode_label = "【预演模式】" if dry_run else ""
     log.info(f"{mode_label}开始同步主副本到镜像...")
 
@@ -420,6 +525,13 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     log.info("扫描主副本...")
     master_files = scan_directory(master_dir, ignore, algorithm)
     log.stats["主副本文件数"] = len(master_files)
+
+    unreadable_files = [rel for rel, info in master_files.items() if info["hash"] is None]
+    if unreadable_files:
+        log.error(f"主副本中有 {len(unreadable_files)} 个文件无法读取，同步已停止。")
+        for rel in unreadable_files[:10]:
+            log.error(f"  — {rel}")
+        return STATUS_ERROR
 
     overall = STATUS_OK
     for mirror_name in get_mirror_names():
@@ -509,10 +621,9 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         if errors > 0:
             overall = STATUS_ERROR
 
-    # 同步后更新基准
-    if not dry_run:
+    # 仅在两份镜像都复制并校验成功后更新基准
+    if not dry_run and overall != STATUS_ERROR:
         log.info("更新校验基准...")
-        baseline = load_baseline(archive_root)
         baseline["updated"] = datetime.datetime.now().isoformat()
         baseline["algorithm"] = algorithm
         baseline["files"] = {}
@@ -523,6 +634,8 @@ def cmd_sync(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
             }
         save_baseline(archive_root, baseline)
         log.info(f"基准已更新，包含 {len(master_files)} 个文件。")
+    elif not dry_run:
+        log.warn("同步未完整成功，校验基准保持不变。")
 
     return overall
 
@@ -533,13 +646,18 @@ def cmd_verify(archive_root: Path, log: ArchiveLogger):
     algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
-    baseline = load_baseline(archive_root)
+    try:
+        baseline = load_required_baseline(archive_root)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.error(f"校验基准不可用: {e}")
+        log.info("请先确认主副本内容正确，再显式运行 sync 重建基准。")
+        return STATUS_ERROR
     baseline_files = baseline.get("files", {})
     baseline_algorithm = baseline.get("algorithm", HASH_ALGORITHM)
 
     log.info("开始完整性校验...")
 
-    if baseline_files and baseline_algorithm != algorithm:
+    if baseline_algorithm != algorithm:
         log.error(
             f"当前配置使用 {algorithm}，但校验基准使用 {baseline_algorithm}。"
             "请先运行 sync 重新生成基准。"
@@ -551,7 +669,11 @@ def cmd_verify(archive_root: Path, log: ArchiveLogger):
 
     # 1. 主副本 vs 基准
     log.info("校验主副本 vs 基准...")
-    master_files = scan_directory(master_dir, ignore, algorithm)
+    try:
+        master_files = scan_directory(master_dir, ignore, algorithm)
+    except OSError as e:
+        log.error(f"主副本扫描失败: {e}")
+        return STATUS_ERROR
 
     ok_count = 0
     for rel, binfo in baseline_files.items():
@@ -650,12 +772,18 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     master_dir = archive_root / MASTER_DIR
     max_snapshots = config.get("max_snapshots", 10)
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    snap_dir = archive_root / SNAPSHOTS_DIR / ts
-    # 避免同秒冲突
-    if snap_dir.exists():
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
-        snap_dir = archive_root / SNAPSHOTS_DIR / ts
+    snapshots_root = archive_root / SNAPSHOTS_DIR
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    base_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = base_ts
+    suffix = 0
+    while True:
+        snap_dir = snapshots_root / ts
+        staging_dir = snapshots_root / f"{SNAPSHOT_STAGING_PREFIX}{ts}"
+        if not snap_dir.exists() and not staging_dir.exists():
+            break
+        suffix += 1
+        ts = f"{base_ts}_{suffix:03d}"
 
     mode_label = "【预演模式】" if dry_run else ""
     log.info(f"{mode_label}创建快照: {ts}")
@@ -665,43 +793,83 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         return STATUS_WARN
 
     # 扫描主副本
-    master_files = scan_directory(master_dir, ignore, algorithm)
+    try:
+        master_files = scan_directory(master_dir, ignore, algorithm)
+    except OSError as e:
+        log.error(f"主副本扫描失败，快照未创建: {e}")
+        return STATUS_ERROR
     log.stats["快照文件数"] = len(master_files)
+
+    unreadable_files = [rel for rel, info in master_files.items() if info["hash"] is None]
+    if unreadable_files:
+        log.error(f"主副本中有 {len(unreadable_files)} 个文件无法读取，快照未创建。")
+        for rel in unreadable_files[:10]:
+            log.error(f"  — {rel}")
+        return STATUS_ERROR
+    if SNAPSHOT_BASELINE_FILE in master_files:
+        log.error(f"主副本根目录包含保留文件名 {SNAPSHOT_BASELINE_FILE}，快照未创建。")
+        return STATUS_ERROR
 
     if dry_run:
         log.info(f"  将创建快照: {snap_dir}")
         log.info(f"  包含 {len(master_files)} 个文件")
         return STATUS_OK
 
-    # 复制
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    # 在隐藏暂存目录中复制并逐项校验；全部成功后才发布。
+    staging_dir.mkdir(parents=True, exist_ok=False)
     errors = 0
-    for rel in master_files:
+    verified_files = {}
+    for rel, info in master_files.items():
         src = master_dir / rel
-        dst = snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst = staging_dir / rel
         try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
+            copied_hash = compute_file_hash(dst, algorithm)
+            copied_size = dst.stat().st_size
+            if copied_hash != info["hash"] or copied_size != info["size"]:
+                log.error(f"  快照拷贝验证失败: {rel}")
+                errors += 1
+                continue
+            verified_files[rel] = {
+                "hash": copied_hash,
+                "size": copied_size,
+            }
         except (OSError, shutil.Error) as e:
             log.error(f"  快照拷贝失败: {rel} — {e}")
             errors += 1
 
-    # 保存快照自己的校验基准
+    if errors > 0 or set(verified_files) != set(master_files):
+        try:
+            remove_tree_writable(staging_dir)
+        except OSError as e:
+            log.warn(f"无法清理未完成的快照暂存目录: {staging_dir} — {e}")
+        log.error("快照复制不完整，未发布快照，旧快照保持不变。")
+        return STATUS_ERROR
+
+    # 清单只记录已在暂存目录中验证成功的文件。
     snap_baseline = {
         "created": datetime.datetime.now().isoformat(),
         "algorithm": algorithm,
         "source": "snapshot",
         "snapshot_id": ts,
-        "files": {},
+        "complete": True,
+        "files": verified_files,
     }
-    for rel, info in master_files.items():
-        snap_baseline["files"][rel] = {
-            "hash": info["hash"],
-            "size": info["size"],
-        }
-    snap_baseline_path = snap_dir / "_snapshot_baseline.json"
-    with open(snap_baseline_path, "w", encoding="utf-8") as f:
-        json.dump(snap_baseline, f, ensure_ascii=False, indent=2)
+    snap_baseline_path = staging_dir / SNAPSHOT_BASELINE_FILE
+    try:
+        with open(snap_baseline_path, "w", encoding="utf-8") as f:
+            json.dump(snap_baseline, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staging_dir, snap_dir)
+    except (OSError, TypeError, ValueError) as e:
+        log.error(f"快照发布失败: {e}")
+        try:
+            remove_tree_writable(staging_dir)
+        except OSError as cleanup_error:
+            log.warn(f"无法清理未完成的快照暂存目录: {staging_dir} — {cleanup_error}")
+        return STATUS_ERROR
 
     # 尝试设为只读
     if config.get("snapshot_readonly", True):
@@ -716,43 +884,39 @@ def cmd_snapshot(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     log.info(f"快照已创建: {snap_dir}")
 
     # 清理旧快照
-    snapshots = sorted([
-        d for d in (archive_root / SNAPSHOTS_DIR).iterdir()
-        if d.is_dir() and d.name != ".archive"
-    ])
+    snapshots = list_published_snapshots(archive_root)
     if len(snapshots) > max_snapshots:
         to_remove = snapshots[:len(snapshots) - max_snapshots]
         for old_snap in to_remove:
             log.info(f"清理旧快照: {old_snap.name}")
-            # 先去掉只读
-            for root, dirs, files in os.walk(old_snap):
-                for fname in files:
-                    fpath = Path(root) / fname
-                    try:
-                        os.chmod(str(fpath), stat.S_IWRITE | stat.S_IREAD)
-                    except OSError:
-                        pass
-            shutil.rmtree(str(old_snap), ignore_errors=True)
+            try:
+                remove_tree_writable(old_snap)
+            except OSError as e:
+                log.warn(f"旧快照清理失败: {old_snap.name} — {e}")
 
-    if errors > 0:
-        return STATUS_ERROR
     return STATUS_OK
 
 
-def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
+def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False,
+               allow_orphan_cleanup: bool = True):
     """修复异常：基于主副本、镜像、快照、基准进行判定和修复"""
     config = load_config(archive_root)
     algorithm = get_config_hash_algorithm(config)
     ignore = config["ignore_patterns"]
     master_dir = archive_root / MASTER_DIR
-    baseline = load_baseline(archive_root)
+    try:
+        baseline = load_required_baseline(archive_root)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.error(f"校验基准不可用: {e}")
+        log.info("请先确认主副本内容正确，再显式运行 sync 重建基准。")
+        return STATUS_ERROR
     baseline_files = baseline.get("files", {})
     baseline_algorithm = baseline.get("algorithm", HASH_ALGORITHM)
 
     mode_label = "【预演模式】" if dry_run else ""
     log.info(f"{mode_label}开始修复检查...")
 
-    if baseline_files and baseline_algorithm != algorithm:
+    if baseline_algorithm != algorithm:
         log.error(
             f"当前配置使用 {algorithm}，但校验基准使用 {baseline_algorithm}。"
             "请先运行 sync 重新生成基准。"
@@ -770,27 +934,26 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
         else:
             mirrors[name] = {}
 
-    # 找最新快照
-    latest_snapshot = None
+    # 找最新一份内容完整且哈希有效的快照
     latest_snap_files = {}
-    snap_dir = archive_root / SNAPSHOTS_DIR
-    if snap_dir.exists():
-        snaps = sorted([d for d in snap_dir.iterdir() if d.is_dir()])
-        if snaps:
-            latest_snapshot = snaps[-1]
-            # 读快照基准
-            snap_bl_path = latest_snapshot / "_snapshot_baseline.json"
-            if snap_bl_path.exists():
-                with open(snap_bl_path, "r", encoding="utf-8") as f:
-                    snap_bl = json.load(f)
-                snap_algorithm = snap_bl.get("algorithm", HASH_ALGORITHM)
-                if snap_algorithm == algorithm:
-                    latest_snap_files = snap_bl.get("files", {})
-                else:
-                    log.warn(
-                        f"最新快照使用 {snap_algorithm}，与当前配置 {algorithm} 不一致，"
-                        "已跳过该快照作为修复依据。"
-                    )
+    snapshots_root = archive_root / SNAPSHOTS_DIR
+    if snapshots_root.exists():
+        candidates = sorted([
+            d for d in snapshots_root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+            and (d / SNAPSHOT_BASELINE_FILE).is_file()
+        ], reverse=True)
+        for candidate in candidates:
+            snap_bl = load_valid_snapshot_baseline(
+                candidate,
+                expected_algorithm=algorithm,
+                verify_hashes=True,
+            )
+            if snap_bl is None:
+                log.warn(f"快照不完整、已损坏或算法不匹配，跳过: {candidate.name}")
+                continue
+            latest_snap_files = snap_bl.get("files", {})
+            break
 
     repaired = 0
     skipped = 0
@@ -832,6 +995,10 @@ def cmd_repair(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
             and rel not in master_files
         ]
         if orphan_mirrors:
+            if not allow_orphan_cleanup:
+                log.warn(f"  镜像残留等待显式 repair 确认: {rel}")
+                skipped += 1
+                continue
             log.info(f"  发现镜像残留文件: {rel}")
             for name in orphan_mirrors:
                 target_path = current_entries[name]["path"]
@@ -1049,7 +1216,7 @@ def cmd_status(archive_root: Path, log: ArchiveLogger):
     # 快照
     snap_dir = archive_root / SNAPSHOTS_DIR
     if snap_dir.exists():
-        snaps = sorted([d.name for d in snap_dir.iterdir() if d.is_dir()])
+        snaps = [d.name for d in list_published_snapshots(archive_root)]
         log.info(f"快照: {len(snaps)} 个")
         if snaps:
             log.info(f"  最新: {snaps[-1]}")
@@ -1058,10 +1225,15 @@ def cmd_status(archive_root: Path, log: ArchiveLogger):
         log.info("快照: 无")
 
     # 基准
-    baseline = load_baseline(archive_root)
-    bl_files = baseline.get("files", {})
-    bl_updated = baseline.get("updated", baseline.get("created", "未知"))
-    log.info(f"基准: {len(bl_files)} 个文件, 更新于 {bl_updated}")
+    baseline_status = STATUS_OK
+    try:
+        baseline = load_required_baseline(archive_root)
+        bl_files = baseline.get("files", {})
+        bl_updated = baseline.get("updated", baseline.get("created", "未知"))
+        log.info(f"基准: {len(bl_files)} 个文件, 更新于 {bl_updated}")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.warn(f"基准: 不可用 ({e})")
+        baseline_status = STATUS_WARN
 
     # 日志
     logs_dir = archive_root / SYSTEM_DIR / LOGS_DIR
@@ -1071,16 +1243,75 @@ def cmd_status(archive_root: Path, log: ArchiveLogger):
         if log_files:
             log.info(f"  最新: {log_files[-1].name}")
 
-    return STATUS_OK
+    return baseline_status
 
 
 def cmd_maintain(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
-    """统一维护流程：巡检 → 快照 → 同步 → 校验 → 修复 → 报告"""
+    """统一维护流程：主副本安全门 → 快照 → 同步 → 校验 → 修复 → 报告"""
     mode_label = "【预演模式】" if dry_run else ""
     log.info(f"{mode_label}开始统一维护流程...")
     log.info("=" * 50)
 
     results = {}
+
+    # 安全门：maintain 不隐式接受已纳入基准文件的删除或内容变化。
+    log.info("")
+    log.info("【安全门】核对主副本与已确认基准...")
+    log.info("-" * 40)
+    config = load_config(archive_root)
+    algorithm = get_config_hash_algorithm(config)
+    ignore = config["ignore_patterns"]
+    master_dir = archive_root / MASTER_DIR
+    try:
+        baseline = load_required_baseline(archive_root)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        log.error(f"校验基准不可用: {e}")
+        log.info("请先确认主副本内容正确，再显式运行 sync 重建基准。")
+        log.error("维护已停止；未创建快照、未同步镜像、未更新基准。")
+        return STATUS_ERROR
+    baseline_files = baseline.get("files", {})
+    baseline_algorithm = baseline.get("algorithm", HASH_ALGORITHM)
+
+    if not master_dir.exists():
+        log.error(f"主副本目录不存在: {master_dir}")
+        log.error("维护已停止；未创建快照、未同步镜像、未更新基准。")
+        return STATUS_ERROR
+    if baseline_algorithm != algorithm:
+        log.error(
+            f"当前配置使用 {algorithm}，但校验基准使用 {baseline_algorithm}。"
+            "请先显式运行 sync 重建基准。"
+        )
+        log.error("维护已停止；未创建快照、未同步镜像、未更新基准。")
+        return STATUS_ERROR
+
+    try:
+        master_files = scan_directory(master_dir, ignore, algorithm)
+    except OSError as e:
+        log.error(f"主副本扫描失败: {e}")
+        log.error("维护已停止；未创建快照、未同步镜像、未更新基准。")
+        return STATUS_ERROR
+    tracked_issues = []
+    for rel, baseline_info in baseline_files.items():
+        master_info = master_files.get(rel)
+        if master_info is None:
+            tracked_issues.append((rel, "文件缺失"))
+        elif master_info["hash"] is None:
+            tracked_issues.append((rel, "无法读取"))
+        elif master_info["hash"] != baseline_info.get("hash"):
+            tracked_issues.append((rel, "内容已变化"))
+
+    if tracked_issues:
+        log.error(f"主副本安全门未通过，发现 {len(tracked_issues)} 个已跟踪文件发生变化:")
+        for rel, reason in tracked_issues[:20]:
+            log.error(f"  — {rel}: {reason}")
+        if len(tracked_issues) > 20:
+            log.error(f"  ...及其他 {len(tracked_issues) - 20} 个文件")
+        log.info("确认这些变化正确时，请显式运行 sync；需要恢复时，请运行 repair。")
+        log.error("维护已停止；未创建快照、未同步镜像、未更新基准。")
+        return STATUS_ERROR
+
+    new_file_count = len(set(master_files) - set(baseline_files))
+    log.info(f"安全门通过：{len(baseline_files)} 个已跟踪文件一致，{new_file_count} 个新文件待纳入。")
 
     # 步骤1: 快照（先保存当前状态）
     log.info("")
@@ -1088,6 +1319,9 @@ def cmd_maintain(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     log.info("-" * 40)
     r = cmd_snapshot(archive_root, log, dry_run)
     results["快照"] = r
+    if r == STATUS_ERROR:
+        log.error("快照未完整创建，维护已停止；未同步镜像、未更新基准。")
+        return STATUS_ERROR
 
     # 步骤2: 同步
     log.info("")
@@ -1095,6 +1329,9 @@ def cmd_maintain(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     log.info("-" * 40)
     r = cmd_sync(archive_root, log, dry_run)
     results["同步"] = r
+    if r == STATUS_ERROR:
+        log.error("同步未完整成功，维护已停止；校验基准保持不变。")
+        return STATUS_ERROR
 
     # 步骤3: 校验
     log.info("")
@@ -1103,13 +1340,23 @@ def cmd_maintain(archive_root: Path, log: ArchiveLogger, dry_run: bool = False):
     r = cmd_verify(archive_root, log)
     results["校验"] = r
 
-    # 步骤4: 如有问题则修复
-    if results["校验"] != STATUS_OK:
+    # 步骤4: 严重问题尝试修复；警告项保留给显式 repair 确认。
+    if results["校验"] == STATUS_ERROR:
         log.info("")
         log.info("【步骤 4/4】尝试修复...")
         log.info("-" * 40)
-        r = cmd_repair(archive_root, log, dry_run)
+        r = cmd_repair(
+            archive_root,
+            log,
+            dry_run,
+            allow_orphan_cleanup=False,
+        )
         results["修复"] = r
+    elif results["校验"] == STATUS_WARN:
+        log.info("")
+        log.info("【步骤 4/4】校验仅有警告，不自动执行清理。")
+        log.info("如需清理镜像残留，请显式运行 repair --dry-run，确认后再运行 repair。")
+        results["修复"] = STATUS_WARN
     else:
         log.info("")
         log.info("【步骤 4/4】校验通过，无需修复。")
@@ -1163,7 +1410,7 @@ def main():
                         help="要执行的命令")
     parser.add_argument("archive_root", help="归档根目录路径")
     parser.add_argument("--dry-run", action="store_true",
-                        help="预演模式：只检查，不实际修改")
+                        help="预演 sync/snapshot/repair/maintain：只检查，不实际修改")
 
     args = parser.parse_args()
     archive_root = Path(args.archive_root).resolve()

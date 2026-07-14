@@ -79,7 +79,7 @@ class VaultAssistant(tk.Tk):
 
         intro = tk.Label(
             self,
-            text="日常只需要选择归档文件夹、打开放文件的文件夹、运行维护。",
+            text="添加新文件后运行维护；确认已有文件的修改后，先同步更改再运行维护。",
             font=("Microsoft YaHei UI", 10),
             anchor="w",
         )
@@ -102,6 +102,7 @@ class VaultAssistant(tk.Tk):
         actions = [
             ("初始化归档", self.init_archive),
             ("打开放文件的文件夹", self.open_master_folder),
+            ("同步已确认更改", self.sync_confirmed_changes),
             ("预演维护", self.dry_run_maintain),
             ("正式维护", self.maintain),
             ("查看状态", self.show_status),
@@ -203,6 +204,12 @@ class VaultAssistant(tk.Tk):
         if archive_root is None:
             return
         self._run_vault(["maintain", str(archive_root), "--dry-run"], "预演维护")
+
+    def sync_confirmed_changes(self) -> None:
+        archive_root = self._initialized_root()
+        if archive_root is None:
+            return
+        self._run_vault(["sync", str(archive_root)], "同步已确认更改")
 
     def maintain(self) -> None:
         archive_root = self._initialized_root()
